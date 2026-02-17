@@ -42,7 +42,7 @@ var (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "gootrago",
+	Use:   "peretran",
 	Short: "CLI Google Translator written on Golang",
 	Long: `A CLI application that translates text files using Google Translate API.
 It supports both Basic and Advanced Google Translate APIs and various language options.
@@ -54,7 +54,7 @@ The Basic API is simpler but has fewer features, while the Advanced API offers m
 	// RunE is used instead of Run to allow error handling
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if version {
-			fmt.Println("gootrago v0.1.0")
+			fmt.Println("peretran v0.1.0")
 			return nil
 		}
 
@@ -97,7 +97,7 @@ func init() {
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.
 
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.gootrago.yaml)")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.peretran.yaml)")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
@@ -133,7 +133,7 @@ func initConfig() {
 		// Search config in home directory with name ".gootrago" (without extension).
 		viper.AddConfigPath(home)
 		viper.SetConfigType("yaml")
-		viper.SetConfigName(".gootrago")
+		viper.SetConfigName(".peretran")
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match

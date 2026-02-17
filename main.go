@@ -15,7 +15,7 @@ limitations under the License.
 */
 package main
 
-import "github.com/valpere/gootrago/cmd"
+import "github.com/valpere/peretran/cmd"
 
 func main() {
 	cmd.Execute()
