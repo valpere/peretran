@@ -1,4 +1,4 @@
-module github.com/valpere/gootrago
+module github.com/valpere/peretran
 
 go 1.23.5
 

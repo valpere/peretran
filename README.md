@@ -1,54 +1,125 @@
-# CLI Google Translator written on Golang
+# peretran
 
-A CLI application that translates text files using Google Translate API.
-It supports both Basic and Advanced Google Translate APIs and various language options.
-The Basic API is simpler but has fewer features, while the Advanced API offers more control but requires a Google Cloud Project ID.
+A CLI application for translating text files using Google Translate API. Written in Go, it supports both Basic and Advanced Google Cloud Translation APIs with configurable options for various file formats.
 
 ## Features
 
-1. Use Basic API by default
-2. Switch to Advanced API when `-a` or `--advanced` flag is used
-3. Require project ID only when using Advanced API
-4. Support all other features (source language detection, custom credentials, etc.) in both modes
-5. Indicate which API version was used in the output
+- **Dual API Support**: Use either Basic or Advanced Google Translate API
+- **File Format Support**: Plain text files and CSV files with column selection
+- **Language Detection**: Automatic source language detection or explicit specification
+- **Flexible Configuration**: Command-line flags and YAML configuration file support
+- **Custom Credentials**: Support for Google Cloud service account credentials
 
-## Example usage
+## Installation
 
-1. Using Basic API (default):
+### Prerequisites
 
-```bash
-./gootrago -i input.txt -o output.txt -t es
-```
+- Go 1.24 or higher
+- Google Cloud Platform account with Translation API enabled
+- Google Cloud service account credentials (JSON key file)
 
-2. Short options with Advanced API:
-
-```bash
-./gootrago -i input.txt -o output.txt -t uk -p your-project-id -a
-```
-
-3. Full options with Advanced API:
+### Build from Source
 
 ```bash
-./gootrago \
-  --input input.txt \
-  --output output.txt \
-  --source en \
-  --target uk \
-  --project your-project-id \
-  --credentials /path/to/creds.json \
-  --advanced
+git clone https://github.com/valpere/peretran.git
+cd peretran
+go build -o peretran
 ```
 
-Configuration file (`.gootrago.yaml`) can now include API preference:
+## Quick Start
+
+### Basic Translation
+
+```bash
+./peretran -i input.txt -o output.txt -t es
+```
+
+### CSV Translation
+
+```bash
+./peretran csv -i data.csv -o translated.csv -t uk
+```
+
+### With Advanced API
+
+```bash
+./peretran -i input.txt -o output.txt -t uk -c /path/to/credentials.json -a -p your-project-id
+```
+
+## Command-Line Options
+
+| Flag | Short | Description | Required |
+|------|-------|-------------|----------|
+| `--input` | `-i` | Input file path | Yes |
+| `--output` | `-o` | Output file path | Yes |
+| `--target` | `-t` | Target language code (e.g., `uk`, `es`, `en`) | Yes |
+| `--source` | `-s` | Source language code (default: `auto` for detection) | No |
+| `--credentials` | `-c` | Path to Google Cloud credentials JSON file | No |
+| `--advanced` | `-a` | Use Advanced Google Translate API | No |
+| `--project` | `-p` | Google Cloud Project ID (required for Advanced API) | Conditional |
+| `--config` | | Custom config file path | No |
+| `--version` | `-v` | Print version information | No |
+
+pecific Options
+
+|### CSV-S Flag | Short | Description |
+|------|-------|-------------|
+| `--column` | `-l` | Column numbers to translate (e.g., `-l 1 -l 3` or `-l A`) |
+| `--csv-delimiter` | | CSV delimiter character |
+| `--csv-comment` | | CSV comment character |
+
+## Configuration File
+
+Create a `.peretran.yaml` file in your home directory:
 
 ```yaml
 input: default-input.txt
 output: default-output.txt
-advanced: true
+target: uk
+source: auto
+advanced: false
 project: your-project-id
 credentials: /path/to/credentials.json
 ```
 
+## Project Structure
+
+```
+peretran/
+├── main.go              # Application entry point
+├── cmd/
+│   ├── root.go          # Main command and flags
+│   ├── csv.go           # CSV translation subcommand
+│   ├── common.go        # File I/O utilities
+│   └── translateEx.go   # Translation API implementations
+├── docs/                # Documentation
+├── go.mod               # Go module file
+├── go.sum               # Dependencies
+├── LICENSE              # Apache 2.0 License
+└── README.md            # This file
+```
+
+## Documentation
+
+- [Installation Guide](docs/installation.md)
+- [Usage Examples](docs/usage.md)
+- [Configuration](docs/configuration.md)
+- [CSV Translation](docs/csv-translation.md)
+
+## Language Codes
+
+Use ISO 639-1 language codes. Examples:
+- `en` - English
+- `es` - Spanish
+- `uk` - Ukrainian
+- `fr` - French
+- `de` - German
+- `auto` - Auto-detect
+
 ## License
 
-This project is licensed under the Apache 2.0 License - see the LICENSE file for details.
+Licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
+
+## Author
+
+Valentyn Solomko - [valentyn.solomko@gmail.com](mailto:valentyn.solomko@gmail.com)
