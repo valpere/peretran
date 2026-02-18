@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/valpere/peretran/internal/postprocess"
 )
 
 var DefaultOpenRouterModels = []string{
@@ -97,7 +98,7 @@ Only respond with the translation, nothing else. No explanations, no quotes, jus
 		return result, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, fmt.Sprintf("%s/chat/completions", s.baseURL), "POST", bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/chat/completions", s.baseURL), bytes.NewBuffer(jsonData))
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create request: %v", err)
 		return result, err
@@ -145,7 +146,7 @@ Only respond with the translation, nothing else. No explanations, no quotes, jus
 		return result, fmt.Errorf("empty response from API")
 	}
 
-	result.TranslatedText = strings.TrimSpace(openrouterResp.Choices[0].Message.Content)
+	result.TranslatedText = postprocess.Clean(openrouterResp.Choices[0].Message.Content)
 	result.Confidence = 0.7
 	result.Metadata = map[string]string{
 		"model":             model,

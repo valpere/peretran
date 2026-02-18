@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/valpere/peretran/internal/postprocess"
 	"github.com/valpere/peretran/internal/translator"
 )
 
@@ -132,7 +133,7 @@ func parseArbiterResponse(response string) (*EvaluationResult, error) {
 
 	return &EvaluationResult{
 		SelectedService: parsed.SelectedService,
-		CompositeText:   parsed.FinalText,
+		CompositeText:   postprocess.Clean(parsed.FinalText),
 		IsComposite:     isComposite,
 		Reasoning:       parsed.Reasoning,
 	}, nil

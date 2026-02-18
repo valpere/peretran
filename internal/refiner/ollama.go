@@ -6,8 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/valpere/peretran/internal/postprocess"
 )
 
 // OllamaRefiner uses a local Ollama model as a literary editor for Stage 2.
@@ -73,7 +74,7 @@ func (r *OllamaRefiner) Refine(ctx context.Context, sourceLang, targetLang, sour
 		return "", fmt.Errorf("failed to decode refinement response: %w", err)
 	}
 
-	refined := cleanRefinedText(ollamaResp.Response)
+	refined := postprocess.Clean(ollamaResp.Response)
 	if refined == "" {
 		return draftText, nil
 	}
@@ -123,31 +124,4 @@ Output ONLY the refined translation in %s. Do not include any explanation.`,
 		targetLang,
 		targetLang,
 	)
-}
-
-// cleanRefinedText removes common LLM artifacts from the refinement output.
-func cleanRefinedText(text string) string {
-	text = strings.TrimSpace(text)
-
-	// Remove thinking tags
-	for _, tag := range []string{"<thinking>", "<think>", "<reasoning>", "<reflection>"} {
-		closeTag := strings.Replace(tag, "<", "</", 1)
-		if start := strings.Index(text, tag); start != -1 {
-			if end := strings.Index(text, closeTag); end != -1 {
-				text = text[:start] + text[end+len(closeTag):]
-			} else {
-				text = text[:start]
-			}
-		}
-	}
-
-	// Strip wrapping quotes
-	if len(text) >= 2 {
-		if (text[0] == '"' && text[len(text)-1] == '"') ||
-			(text[0] == '\'' && text[len(text)-1] == '\'') {
-			text = text[1 : len(text)-1]
-		}
-	}
-
-	return strings.TrimSpace(text)
 }
