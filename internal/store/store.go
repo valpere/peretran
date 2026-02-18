@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/valpere/peretran/internal"
 )
@@ -68,6 +70,7 @@ func (s *Store) migrate() error {
 		source_lang TEXT NOT NULL,
 		target_lang TEXT NOT NULL,
 		final_text TEXT NOT NULL,
+		draft_text TEXT,
 		service_used TEXT,
 		usage_count INTEGER DEFAULT 1,
 		invalidated BOOLEAN DEFAULT FALSE,
@@ -76,7 +79,21 @@ func (s *Store) migrate() error {
 		UNIQUE(source_text, source_lang, target_lang)
 	);
 
+	-- stage1_cache stores primary translation drafts (pre-refinement)
+	CREATE TABLE IF NOT EXISTS stage1_cache (
+		id TEXT PRIMARY KEY,
+		source_text TEXT NOT NULL,
+		source_lang TEXT NOT NULL,
+		target_lang TEXT NOT NULL,
+		draft_text TEXT NOT NULL,
+		service_used TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(source_text, source_lang, target_lang, service_used)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_memory_lookup ON translation_memory(source_text, source_lang, target_lang);
+	CREATE INDEX IF NOT EXISTS idx_stage1_lookup ON stage1_cache(source_text, source_lang, target_lang);
 	CREATE INDEX IF NOT EXISTS idx_results_request ON translation_results(request_id);
 	`
 
@@ -133,12 +150,60 @@ func (s *Store) GetCachedTranslation(ctx context.Context, sourceText, sourceLang
 	return finalText, true, err
 }
 
-func (s *Store) SaveToMemory(ctx context.Context, sourceText, sourceLang, targetLang, finalText, serviceUsed string) error {
+func (s *Store) SaveToMemory(ctx context.Context, sourceText, sourceLang, targetLang, finalText, draftText, serviceUsed string) error {
 	id := fmt.Sprintf("mem_%d", time.Now().UnixNano())
 	_, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO translation_memory (id, source_text, source_lang, target_lang, final_text, service_used, usage_count, invalidated, last_used, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, FALSE, ?, ?)`,
-		id, normalizeText(sourceText), sourceLang, targetLang, finalText, serviceUsed, time.Now(), time.Now())
+		`INSERT OR REPLACE INTO translation_memory (id, source_text, source_lang, target_lang, final_text, draft_text, service_used, usage_count, invalidated, last_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, FALSE, ?, ?)`,
+		id, normalizeText(sourceText), sourceLang, targetLang, finalText, draftText, serviceUsed, time.Now(), time.Now())
 	return err
+}
+
+// SaveToStage1Cache stores the primary (pre-refinement) translation draft.
+func (s *Store) SaveToStage1Cache(ctx context.Context, sourceText, sourceLang, targetLang, draftText, serviceUsed string) error {
+	id := fmt.Sprintf("s1_%d", time.Now().UnixNano())
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO stage1_cache (id, source_text, source_lang, target_lang, draft_text, service_used, created_at, last_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, normalizeText(sourceText), sourceLang, targetLang, draftText, serviceUsed, time.Now(), time.Now())
+	return err
+}
+
+// GetStage1Draft returns a cached stage1 draft if available.
+func (s *Store) GetStage1Draft(ctx context.Context, sourceText, sourceLang, targetLang, serviceUsed string) (string, bool, error) {
+	var draftText string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT draft_text FROM stage1_cache WHERE source_text = ? AND source_lang = ? AND target_lang = ? AND service_used = ?`,
+		normalizeText(sourceText), sourceLang, targetLang, serviceUsed).Scan(&draftText)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	_, _ = s.db.ExecContext(ctx,
+		`UPDATE stage1_cache SET last_used = ? WHERE source_text = ? AND source_lang = ? AND target_lang = ? AND service_used = ?`,
+		time.Now(), normalizeText(sourceText), sourceLang, targetLang, serviceUsed)
+	return draftText, true, nil
+}
+
+// MemoryEntry is a row from the translation_memory table.
+type MemoryEntry struct {
+	ID          string
+	SourceText  string
+	SourceLang  string
+	TargetLang  string
+	FinalText   string
+	ServiceUsed string
+	UsageCount  int
+	Invalidated bool
+	LastUsed    time.Time
+}
+
+// CacheStats summarises translation memory usage.
+type CacheStats struct {
+	TotalEntries   int
+	ActiveEntries  int
+	InvalidEntries int
+	TotalUsage     int
 }
 
 func (s *Store) InvalidateMemory(ctx context.Context, id string) error {
@@ -146,7 +211,23 @@ func (s *Store) InvalidateMemory(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Store) ListMemory(ctx context.Context) ([]map[string]interface{}, error) {
+// DeleteMemory permanently removes a translation memory entry by ID.
+func (s *Store) DeleteMemory(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM translation_memory WHERE id = ?`, id)
+	return err
+}
+
+// ClearMemory removes all translation memory entries.
+func (s *Store) ClearMemory(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM translation_memory`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ListMemory returns all translation memory entries ordered by most recently used.
+func (s *Store) ListMemory(ctx context.Context) ([]MemoryEntry, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, source_text, source_lang, target_lang, final_text, service_used, usage_count, invalidated, last_used FROM translation_memory ORDER BY last_used DESC`)
 	if err != nil {
@@ -154,37 +235,46 @@ func (s *Store) ListMemory(ctx context.Context) ([]map[string]interface{}, error
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
+	var results []MemoryEntry
 	for rows.Next() {
-		var id, sourceText, sourceLang, targetLang, finalText, serviceUsed string
-		var usageCount int
-		var invalidated bool
-		var lastUsed time.Time
-
-		if err := rows.Scan(&id, &sourceText, &sourceLang, &targetLang, &finalText, &serviceUsed, &usageCount, &invalidated, &lastUsed); err != nil {
+		var e MemoryEntry
+		if err := rows.Scan(&e.ID, &e.SourceText, &e.SourceLang, &e.TargetLang, &e.FinalText, &e.ServiceUsed, &e.UsageCount, &e.Invalidated, &e.LastUsed); err != nil {
 			return nil, err
 		}
-
-		results = append(results, map[string]interface{}{
-			"id":           id,
-			"source_text":  sourceText,
-			"source_lang":  sourceLang,
-			"target_lang":  targetLang,
-			"final_text":   finalText,
-			"service_used": serviceUsed,
-			"usage_count":  usageCount,
-			"invalidated":  invalidated,
-			"last_used":    lastUsed,
-		})
+		results = append(results, e)
 	}
 
-	return results, nil
+	return results, rows.Err()
+}
+
+// Stats returns summary statistics for the translation memory.
+func (s *Store) Stats(ctx context.Context) (*CacheStats, error) {
+	stats := &CacheStats{}
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN NOT invalidated THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN invalidated THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(usage_count), 0)
+		FROM translation_memory`).Scan(
+		&stats.TotalEntries,
+		&stats.ActiveEntries,
+		&stats.InvalidEntries,
+		&stats.TotalUsage,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
 }
 
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// normalizeText trims whitespace and applies Unicode NFC normalization
+// for consistent cache key comparison.
 func normalizeText(text string) string {
-	return text
+	return norm.NFC.String(strings.TrimSpace(text))
 }

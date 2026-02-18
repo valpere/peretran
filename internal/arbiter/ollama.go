@@ -68,7 +68,7 @@ func (a *OllamaArbiter) Evaluate(ctx context.Context, source string, sourceLang,
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, fmt.Sprintf("%s/api/generate", a.baseURL), "POST", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/generate", a.baseURL), bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
