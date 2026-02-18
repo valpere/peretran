@@ -55,8 +55,9 @@ var (
 	systranKey    string
 	mymemoryEmail string
 
-	dbPath  string
-	noCache bool
+	dbPath     string
+	noCache    bool
+	maxRetries int
 
 	useRefine    bool
 	refinerModel string
@@ -127,7 +128,6 @@ Two-pass translation:
 		cfg := translator.ServiceConfig{
 			Credentials: credentials,
 			ProjectID:   projectID,
-			Timeout:     30 * time.Second,
 		}
 
 		serviceList, err := buildServices(services, ollamaURL, openrouterKey, systranKey, mymemoryEmail, ollamaModels, openrouterModels)
@@ -136,8 +136,9 @@ Two-pass translation:
 		}
 
 		orch := orchestrator.New(serviceList, orchestrator.OrchestratorConfig{
-			Timeout:     120 * time.Second,
+			Timeout:     30 * time.Second,
 			MinServices: 1,
+			MaxAttempts: maxRetries,
 		})
 
 		req := translator.TranslateRequest{
@@ -259,6 +260,7 @@ func init() {
 
 	translateCmd.Flags().StringVar(&dbPath, "db", "./data/peretran.db", "Database path for translation memory")
 	translateCmd.Flags().BoolVar(&noCache, "no-cache", false, "Disable translation memory cache")
+	translateCmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Total attempts per service including the first (1 = no retries)")
 
 	translateCmd.MarkFlagRequired("input")
 	translateCmd.MarkFlagRequired("output")

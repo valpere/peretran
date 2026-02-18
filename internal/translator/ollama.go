@@ -90,7 +90,7 @@ Translation:`, sourceLang, req.TargetLang, req.Text)
 		return result, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, fmt.Sprintf("%s/api/generate", s.baseURL), "POST", bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/generate", s.baseURL), bytes.NewBuffer(jsonData))
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create request: %v", err)
 		return result, err
@@ -127,7 +127,7 @@ Translation:`, sourceLang, req.TargetLang, req.Text)
 }
 
 func (s *OllamaTranslator) IsAvailable(ctx context.Context) error {
-	req, _ := http.NewRequestWithContext(ctx, fmt.Sprintf("%s/api/tags", s.baseURL), "GET", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/tags", s.baseURL), nil)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("Ollama not available: %v", err)

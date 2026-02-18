@@ -53,6 +53,8 @@ var (
 	csvUseRefine    bool
 	csvRefinerModel string
 	csvRefinerURL   string
+
+	csvMaxRetries int
 )
 
 var csvCmd = &cobra.Command{
@@ -103,13 +105,12 @@ Example:
 			return err
 		}
 
-		cfg := translator.ServiceConfig{
-			Timeout: 30 * time.Second,
-		}
+		cfg := translator.ServiceConfig{}
 
 		orch := orchestrator.New(serviceList, orchestrator.OrchestratorConfig{
-			Timeout:     120 * time.Second,
+			Timeout:     30 * time.Second,
 			MinServices: 1,
+			MaxAttempts: csvMaxRetries,
 		})
 
 		// Determine which columns to translate
@@ -215,6 +216,7 @@ func init() {
 	csvCmd.Flags().StringSliceVar(&csvOpenrouterModels, "openrouter-models", nil, "OpenRouter models to rotate (default list used if empty)")
 	csvCmd.Flags().StringVar(&csvSystranKey, "systran-key", "", "Systran API key")
 	csvCmd.Flags().StringVar(&csvMymemoryEmail, "mymemory-email", "", "MyMemory email (for higher limits)")
+	csvCmd.Flags().IntVar(&csvMaxRetries, "max-retries", 3, "Total attempts per service including the first (1 = no retries)")
 
 	csvCmd.MarkFlagRequired("input")
 	csvCmd.MarkFlagRequired("output")
