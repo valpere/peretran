@@ -24,15 +24,17 @@ func Clean(text string) string {
 // --- Phase 1: thinking blocks ---
 
 // thinkingBlockRe matches complete <thinking>…</thinking> style blocks.
+// Each tag variant is listed explicitly because Go's RE2 engine does not
+// support backreferences.
 // Flags: i = case-insensitive, s = dot matches newline.
 var thinkingBlockRe = regexp.MustCompile(
-	`(?is)<(thinking|think|reasoning|reflection)>.*?</\1>`,
+	`(?is)<thinking>.*?</thinking>|<think>.*?</think>|<reasoning>.*?</reasoning>|<reflection>.*?</reflection>`,
 )
 
-// truncatedThinkingRe matches an opened thinking tag whose closing tag is missing
-// (the model was cut off mid-thought).
+// truncatedThinkingRe matches an opened thinking tag whose closing tag is
+// missing (the model was cut off mid-thought).
 var truncatedThinkingRe = regexp.MustCompile(
-	`(?is)<(thinking|think|reasoning|reflection)>.*$`,
+	`(?is)(?:<thinking>|<think>|<reasoning>|<reflection>).*$`,
 )
 
 func removeThinkingBlocks(text string) string {

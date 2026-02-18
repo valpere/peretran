@@ -28,6 +28,7 @@ import (
 	"github.com/valpere/peretran/internal/detector"
 	"github.com/valpere/peretran/internal/orchestrator"
 	"github.com/valpere/peretran/internal/refiner"
+	"github.com/valpere/peretran/internal/store"
 	"github.com/valpere/peretran/internal/translator"
 )
 
@@ -43,18 +44,21 @@ var (
 	csvArbiterModel string
 	csvArbiterURL   string
 
-	csvOllamaURL         string
-	csvOllamaModels      []string
-	csvOpenrouterKey     string
-	csvOpenrouterModels  []string
-	csvSystranKey        string
-	csvMymemoryEmail     string
+	csvOllamaURL        string
+	csvOllamaModels     []string
+	csvOpenrouterKey    string
+	csvOpenrouterModels []string
+	csvSystranKey       string
+	csvMymemoryEmail    string
 
 	csvUseRefine    bool
 	csvRefinerModel string
 	csvRefinerURL   string
 
 	csvMaxRetries int
+	csvDBPath     string
+	csvNoCache    bool
+	csvResume     string
 )
 
 var csvCmd = &cobra.Command{
@@ -65,8 +69,12 @@ var csvCmd = &cobra.Command{
 By default all columns are translated. Use -l to select specific columns
 (0-indexed). The flag may be repeated to select multiple columns.
 
+A checkpoint ID is printed at the start of each run. If the job is interrupted,
+use --resume with that ID to skip already-translated cells.
+
 Example:
-  peretran translate csv -i data.csv -o out.csv -t uk -l 1 -l 3`,
+  peretran translate csv -i data.csv -o out.csv -t uk -l 1 -l 3
+  peretran translate csv -i data.csv -o out.csv -t uk --resume cp_123456789`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if csvInputFile == csvOutputFile {
 			return fmt.Errorf("input file and output file cannot be the same")
@@ -100,6 +108,43 @@ Example:
 			}
 		}
 
+		// Open store for cache and checkpoint support.
+		var db *store.Store
+		if !csvNoCache && csvDBPath != "" {
+			db, err = store.New(csvDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open database: %w", err)
+			}
+			defer db.Close()
+		}
+
+		// Load or create checkpoint.
+		var checkpointID string
+		completedCells := make(map[string]string)
+
+		if csvResume != "" {
+			if db == nil {
+				return fmt.Errorf("--resume requires --db to be set and --no-cache to be disabled")
+			}
+			if _, cpErr := db.GetCSVCheckpoint(ctx, csvResume); cpErr != nil {
+				return fmt.Errorf("failed to load checkpoint: %w", cpErr)
+			}
+			checkpointID = csvResume
+			cells, cpErr := db.GetCSVCells(ctx, checkpointID)
+			if cpErr != nil {
+				return fmt.Errorf("failed to load checkpoint cells: %w", cpErr)
+			}
+			completedCells = cells
+			fmt.Fprintf(os.Stderr, "Resuming checkpoint %s (%d cells already done)\n", checkpointID, len(completedCells))
+		} else if db != nil {
+			checkpointID, err = db.CreateCSVCheckpoint(ctx, csvInputFile, csvOutputFile, srcLang, csvTargetLang)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to create checkpoint: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Checkpoint ID: %s (use --resume %s to resume if interrupted)\n", checkpointID, checkpointID)
+			}
+		}
+
 		serviceList, err := buildServices(csvServices, csvOllamaURL, csvOpenrouterKey, csvSystranKey, csvMymemoryEmail, csvOllamaModels, csvOpenrouterModels)
 		if err != nil {
 			return err
@@ -113,14 +158,14 @@ Example:
 			MaxAttempts: csvMaxRetries,
 		})
 
-		// Determine which columns to translate
+		// Determine which columns to translate.
 		colSet := make(map[int]bool, len(csvColumns))
 		for _, c := range csvColumns {
 			colSet[c] = true
 		}
 		translateAll := len(csvColumns) == 0
 
-		// Build output records
+		// Build output records.
 		out := make([][]string, len(records))
 		for rowIdx, row := range records {
 			out[rowIdx] = make([]string, len(row))
@@ -132,6 +177,25 @@ Example:
 				}
 				if cell == "" {
 					continue
+				}
+
+				cellKey := fmt.Sprintf("%d:%d", rowIdx, colIdx)
+
+				// Use checkpoint data when resuming.
+				if translated, done := completedCells[cellKey]; done {
+					out[rowIdx][colIdx] = translated
+					continue
+				}
+
+				// Check translation memory cache.
+				if db != nil {
+					if cached, found, cacheErr := db.GetCachedTranslation(ctx, cell, srcLang, csvTargetLang); cacheErr == nil && found {
+						out[rowIdx][colIdx] = cached
+						if checkpointID != "" {
+							_ = db.SaveCSVCell(ctx, checkpointID, rowIdx, colIdx, cached)
+						}
+						continue
+					}
 				}
 
 				req := translator.TranslateRequest{
@@ -169,6 +233,16 @@ Example:
 				}
 
 				out[rowIdx][colIdx] = translated
+
+				// Persist to cache and checkpoint.
+				if db != nil {
+					draftText := result.Results[0].TranslatedText
+					serviceUsed := result.Results[0].ServiceName
+					_ = db.SaveToMemory(ctx, cell, srcLang, csvTargetLang, translated, draftText, serviceUsed)
+					if checkpointID != "" {
+						_ = db.SaveCSVCell(ctx, checkpointID, rowIdx, colIdx, translated)
+					}
+				}
 			}
 		}
 
@@ -185,6 +259,11 @@ Example:
 		writer.Flush()
 		if err := writer.Error(); err != nil {
 			return fmt.Errorf("failed to flush output CSV: %w", err)
+		}
+
+		// Mark checkpoint complete.
+		if db != nil && checkpointID != "" {
+			_ = db.CompleteCSVCheckpoint(ctx, checkpointID)
 		}
 
 		fmt.Printf("CSV translated successfully: %s\n", csvOutputFile)
@@ -217,6 +296,10 @@ func init() {
 	csvCmd.Flags().StringVar(&csvSystranKey, "systran-key", "", "Systran API key")
 	csvCmd.Flags().StringVar(&csvMymemoryEmail, "mymemory-email", "", "MyMemory email (for higher limits)")
 	csvCmd.Flags().IntVar(&csvMaxRetries, "max-retries", 3, "Total attempts per service including the first (1 = no retries)")
+
+	csvCmd.Flags().StringVar(&csvDBPath, "db", "./data/peretran.db", "Database path for translation memory and checkpoints")
+	csvCmd.Flags().BoolVar(&csvNoCache, "no-cache", false, "Disable translation memory cache and checkpoints")
+	csvCmd.Flags().StringVar(&csvResume, "resume", "", "Resume from checkpoint ID (printed at start of original run)")
 
 	csvCmd.MarkFlagRequired("input")
 	csvCmd.MarkFlagRequired("output")
