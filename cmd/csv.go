@@ -16,124 +16,207 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
+	"encoding/csv"
 	"fmt"
-	"strconv"
-	"strings"
+	"os"
+	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/valpere/peretran/internal/arbiter"
+	"github.com/valpere/peretran/internal/detector"
+	"github.com/valpere/peretran/internal/orchestrator"
+	"github.com/valpere/peretran/internal/refiner"
+	"github.com/valpere/peretran/internal/translator"
 )
 
-// csvCmd represents the csv command
+var (
+	csvInputFile  string
+	csvOutputFile string
+	csvSourceLang string
+	csvTargetLang string
+	csvColumns    []int
+
+	csvServices     []string
+	csvUseArbiter   bool
+	csvArbiterModel string
+	csvArbiterURL   string
+
+	csvOllamaURL         string
+	csvOllamaModels      []string
+	csvOpenrouterKey     string
+	csvOpenrouterModels  []string
+	csvSystranKey        string
+	csvMymemoryEmail     string
+
+	csvUseRefine    bool
+	csvRefinerModel string
+	csvRefinerURL   string
+)
+
 var csvCmd = &cobra.Command{
 	Use:   "csv",
-	Short: "Translate CSV files or specific columns",
-	Long: `A flexible CSV translation tool that can translate entire files or specific columns while preserving the original structure. 
-Supports both Basic and Advanced Google Cloud Translation APIs and various CSV formats.`,
-	// Run: func(cmd *cobra.Command, args []string) {
-	// 	fmt.Println("csv called")
-	// },
+	Short: "Translate columns of a CSV file",
+	Long: `Translate one or more columns in a CSV file.
+
+By default all columns are translated. Use -l to select specific columns
+(0-indexed). The flag may be repeated to select multiple columns.
+
+Example:
+  peretran translate csv -i data.csv -o out.csv -t uk -l 1 -l 3`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if inputFile == outputFile {
-			return fmt.Errorf("input file and output file are the same: %v", inputFile)
+		if csvInputFile == csvOutputFile {
+			return fmt.Errorf("input file and output file cannot be the same")
 		}
 
-		// Start indicator:
-		shutdownCh := make(chan struct{})
-		go indicator(shutdownCh)
-
-		defer close(shutdownCh) // Signal indicator() to terminate
-
-		csv, err := readCSVToSlice(inputFile, false, csvDelimiter, csvComment)
+		f, err := os.Open(csvInputFile)
 		if err != nil {
-			return fmt.Errorf("failed to read CSV file: %v", err)
+			return fmt.Errorf("failed to open input CSV: %w", err)
+		}
+		defer f.Close()
+
+		reader := csv.NewReader(f)
+		records, err := reader.ReadAll()
+		if err != nil {
+			return fmt.Errorf("failed to read CSV: %w", err)
 		}
 
-		colNumbers, err := decodeColNumbers(csvColumn, len(csv[0]))
-		if err != nil {
-			return err
+		if len(records) == 0 {
+			return fmt.Errorf("CSV file is empty")
 		}
-		nCols := len(colNumbers)
-		for i, row := range csv {
-			if nCols == 0 {
-				strOut, err := translateEx(row, useAdvanced)
-				if err != nil {
-					return fmt.Errorf("failed to translate text: %v", err)
-				}
-				csv[i] = strOut
-			} else {
-				strInp := make([]string, 0, nCols)
-				for _, v := range colNumbers {
-					strInp = append(strInp, row[v-1])
-				}
-				strOut, err := translateEx(strInp, useAdvanced)
-				if err != nil {
-					return fmt.Errorf("failed to translate text: %v", err)
-				}
-				for k, v := range strOut {
-					row[colNumbers[k]-1] = v
-				}
+
+		ctx := context.Background()
+
+		srcLang := csvSourceLang
+		if srcLang == "auto" && len(records) > 1 && len(records[1]) > 0 {
+			det := detector.New()
+			sample := records[1][0]
+			if detected, ok := det.DetectISO(sample); ok {
+				srcLang = detected
+				fmt.Fprintf(os.Stderr, "Detected source language: %s\n", srcLang)
 			}
 		}
 
-		return writeSliceToCSV(outputFile, csv, nil, csvDelimiter)
+		serviceList, err := buildServices(csvServices, csvOllamaURL, csvOpenrouterKey, csvSystranKey, csvMymemoryEmail, csvOllamaModels, csvOpenrouterModels)
+		if err != nil {
+			return err
+		}
+
+		cfg := translator.ServiceConfig{
+			Timeout: 30 * time.Second,
+		}
+
+		orch := orchestrator.New(serviceList, orchestrator.OrchestratorConfig{
+			Timeout:     120 * time.Second,
+			MinServices: 1,
+		})
+
+		// Determine which columns to translate
+		colSet := make(map[int]bool, len(csvColumns))
+		for _, c := range csvColumns {
+			colSet[c] = true
+		}
+		translateAll := len(csvColumns) == 0
+
+		// Build output records
+		out := make([][]string, len(records))
+		for rowIdx, row := range records {
+			out[rowIdx] = make([]string, len(row))
+			copy(out[rowIdx], row)
+
+			for colIdx, cell := range row {
+				if !translateAll && !colSet[colIdx] {
+					continue
+				}
+				if cell == "" {
+					continue
+				}
+
+				req := translator.TranslateRequest{
+					Text:       cell,
+					SourceLang: srcLang,
+					TargetLang: csvTargetLang,
+				}
+
+				result := orch.Execute(ctx, cfg, req)
+				if result.Succeeded == 0 {
+					fmt.Fprintf(os.Stderr, "Row %d col %d: all services failed, keeping original\n", rowIdx, colIdx)
+					continue
+				}
+
+				translated := result.Results[0].TranslatedText
+
+				if csvUseArbiter && len(result.Results) > 1 {
+					arb := arbiter.NewOllamaArbiter(csvArbiterModel, csvArbiterURL)
+					eval, arbErr := arb.Evaluate(ctx, cell, srcLang, csvTargetLang, result.Results)
+					if arbErr != nil {
+						fmt.Fprintf(os.Stderr, "Arbiter failed row %d col %d: %v\n", rowIdx, colIdx, arbErr)
+					} else {
+						translated = eval.CompositeText
+					}
+				}
+
+				if csvUseRefine {
+					ref := refiner.NewOllamaRefiner(csvRefinerModel, csvRefinerURL)
+					refined, refErr := ref.Refine(ctx, srcLang, csvTargetLang, cell, translated)
+					if refErr != nil {
+						fmt.Fprintf(os.Stderr, "Refiner failed row %d col %d: %v\n", rowIdx, colIdx, refErr)
+					} else {
+						translated = refined
+					}
+				}
+
+				out[rowIdx][colIdx] = translated
+			}
+		}
+
+		outFile, err := os.Create(csvOutputFile)
+		if err != nil {
+			return fmt.Errorf("failed to create output CSV: %w", err)
+		}
+		defer outFile.Close()
+
+		writer := csv.NewWriter(outFile)
+		if err := writer.WriteAll(out); err != nil {
+			return fmt.Errorf("failed to write output CSV: %w", err)
+		}
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			return fmt.Errorf("failed to flush output CSV: %w", err)
+		}
+
+		fmt.Printf("CSV translated successfully: %s\n", csvOutputFile)
+		return nil
 	},
 }
 
 func init() {
-	rootCmd.AddCommand(csvCmd)
+	translateCmd.AddCommand(csvCmd)
 
-	// Here you will define your flags and configuration settings.
+	csvCmd.Flags().StringVarP(&csvInputFile, "input", "i", "", "Input CSV file (required)")
+	csvCmd.Flags().StringVarP(&csvOutputFile, "output", "o", "", "Output CSV file (required)")
+	csvCmd.Flags().StringVarP(&csvSourceLang, "source", "s", "auto", "Source language code")
+	csvCmd.Flags().StringVarP(&csvTargetLang, "target", "t", "", "Target language code (required)")
+	csvCmd.Flags().IntSliceVarP(&csvColumns, "column", "l", nil, "Column index to translate (0-indexed, repeatable; default: all columns)")
 
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// csvCmd.PersistentFlags().String("foo", "", "A help for foo")
+	csvCmd.Flags().StringSliceVar(&csvServices, "services", []string{"google"}, "Translation services to use (comma-separated)")
+	csvCmd.Flags().BoolVar(&csvUseArbiter, "arbiter", false, "Use LLM arbiter to select best translation")
+	csvCmd.Flags().StringVar(&csvArbiterModel, "arbiter-model", "llama3.2", "Arbiter model name")
+	csvCmd.Flags().StringVar(&csvArbiterURL, "arbiter-url", "http://localhost:11434", "Arbiter Ollama URL")
 
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// csvCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-	csvCmd.Flags().StringSliceVarP(&csvColumn, "column", "l", []string{}, "One or many columns number to translate (can be specified multiple times). Numeration starts from '1' or 'A'")
-	csvCmd.Flags().StringVarP(&csvDelimiter, "csv-delimiter", "", "", "Delimiter for CSV files")
-	csvCmd.Flags().StringVarP(&csvComment, "csv-comment", "", "", "Comment character for CSV files")
-}
+	csvCmd.Flags().BoolVar(&csvUseRefine, "refine", false, "Enable Stage 2 literary refinement")
+	csvCmd.Flags().StringVar(&csvRefinerModel, "refiner-model", "llama3.2", "Refiner model name")
+	csvCmd.Flags().StringVar(&csvRefinerURL, "refiner-url", "http://localhost:11434", "Refiner Ollama URL")
 
-func decodeColNumbers(csvColumn []string, csvWidth int) ([]int, error) {
-	var colNumbers []int = make([]int, 0, len(csvColumn))
-	for _, col := range csvColumn {
-		col = strings.ToUpper(strings.TrimSpace(col))
-		var colNumber int
-		var err error
-		if (col[0] >= 'A') && (col[0] <= 'Z') {
-			colNumber = titleToNumber(col)
-		} else {
-			colNumber, err = strconv.Atoi(col)
-			if err != nil {
-				return nil, fmt.Errorf("invalid column number: %v", col)
-			}
-		}
+	csvCmd.Flags().StringVar(&csvOllamaURL, "ollama-url", "http://localhost:11434", "Ollama base URL")
+	csvCmd.Flags().StringSliceVar(&csvOllamaModels, "ollama-models", nil, "Ollama models to rotate (default list used if empty)")
+	csvCmd.Flags().StringVar(&csvOpenrouterKey, "openrouter-key", "", "OpenRouter API key")
+	csvCmd.Flags().StringSliceVar(&csvOpenrouterModels, "openrouter-models", nil, "OpenRouter models to rotate (default list used if empty)")
+	csvCmd.Flags().StringVar(&csvSystranKey, "systran-key", "", "Systran API key")
+	csvCmd.Flags().StringVar(&csvMymemoryEmail, "mymemory-email", "", "MyMemory email (for higher limits)")
 
-		if (colNumber < 1) || (colNumber > csvWidth) {
-			return nil, fmt.Errorf("column number is out of range: %v", col)
-		}
-		colNumbers = append(colNumbers, colNumber)
-	}
-
-	return colNumbers, nil
-}
-
-func titleToNumber(columnTitle string) int {
-	l := len(columnTitle)
-	if l < 1 {
-		return 0
-	}
-
-	res := 0
-	for _, c := range columnTitle {
-		if (c < 'A') || (c > 'Z') {
-			return 0
-		}
-
-		res = res*26 + int(c-'A'+1)
-	}
-
-	return res
+	csvCmd.MarkFlagRequired("input")
+	csvCmd.MarkFlagRequired("output")
+	csvCmd.MarkFlagRequired("target")
 }
