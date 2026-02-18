@@ -92,9 +92,33 @@ func (s *Store) migrate() error {
 		UNIQUE(source_text, source_lang, target_lang, service_used)
 	);
 
+	-- csv_checkpoints tracks progress of CSV translation jobs for resume support
+	CREATE TABLE IF NOT EXISTS csv_checkpoints (
+		id TEXT PRIMARY KEY,
+		input_file TEXT NOT NULL,
+		output_file TEXT NOT NULL,
+		source_lang TEXT NOT NULL,
+		target_lang TEXT NOT NULL,
+		status TEXT DEFAULT 'running',
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- csv_checkpoint_cells stores per-cell translated results
+	CREATE TABLE IF NOT EXISTS csv_checkpoint_cells (
+		checkpoint_id TEXT NOT NULL,
+		row_idx INTEGER NOT NULL,
+		col_idx INTEGER NOT NULL,
+		translated_text TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (checkpoint_id, row_idx, col_idx),
+		FOREIGN KEY (checkpoint_id) REFERENCES csv_checkpoints(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_memory_lookup ON translation_memory(source_text, source_lang, target_lang);
 	CREATE INDEX IF NOT EXISTS idx_stage1_lookup ON stage1_cache(source_text, source_lang, target_lang);
 	CREATE INDEX IF NOT EXISTS idx_results_request ON translation_results(request_id);
+	CREATE INDEX IF NOT EXISTS idx_checkpoint_cells ON csv_checkpoint_cells(checkpoint_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -267,6 +291,76 @@ func (s *Store) Stats(ctx context.Context) (*CacheStats, error) {
 		return nil, err
 	}
 	return stats, nil
+}
+
+// CSVCheckpoint represents a CSV translation job's checkpoint record.
+type CSVCheckpoint struct {
+	ID         string
+	InputFile  string
+	OutputFile string
+	SourceLang string
+	TargetLang string
+	Status     string
+	CreatedAt  time.Time
+}
+
+// CreateCSVCheckpoint creates a new checkpoint record and returns its ID.
+func (s *Store) CreateCSVCheckpoint(ctx context.Context, inputFile, outputFile, sourceLang, targetLang string) (string, error) {
+	id := fmt.Sprintf("cp_%d", time.Now().UnixNano())
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO csv_checkpoints (id, input_file, output_file, source_lang, target_lang) VALUES (?, ?, ?, ?, ?)`,
+		id, inputFile, outputFile, sourceLang, targetLang)
+	return id, err
+}
+
+// GetCSVCheckpoint retrieves a checkpoint by ID.
+func (s *Store) GetCSVCheckpoint(ctx context.Context, checkpointID string) (*CSVCheckpoint, error) {
+	var cp CSVCheckpoint
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, input_file, output_file, source_lang, target_lang, status, created_at FROM csv_checkpoints WHERE id = ?`,
+		checkpointID).Scan(&cp.ID, &cp.InputFile, &cp.OutputFile, &cp.SourceLang, &cp.TargetLang, &cp.Status, &cp.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("checkpoint not found: %s", checkpointID)
+	}
+	return &cp, err
+}
+
+// SaveCSVCell persists the translated text for a single CSV cell.
+func (s *Store) SaveCSVCell(ctx context.Context, checkpointID string, rowIdx, colIdx int, translatedText string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO csv_checkpoint_cells (checkpoint_id, row_idx, col_idx, translated_text) VALUES (?, ?, ?, ?)`,
+		checkpointID, rowIdx, colIdx, translatedText)
+	return err
+}
+
+// GetCSVCells returns all already-translated cells for a checkpoint as a "row:col" → text map.
+func (s *Store) GetCSVCells(ctx context.Context, checkpointID string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT row_idx, col_idx, translated_text FROM csv_checkpoint_cells WHERE checkpoint_id = ?`,
+		checkpointID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cells := make(map[string]string)
+	for rows.Next() {
+		var rowIdx, colIdx int
+		var translatedText string
+		if err := rows.Scan(&rowIdx, &colIdx, &translatedText); err != nil {
+			return nil, err
+		}
+		cells[fmt.Sprintf("%d:%d", rowIdx, colIdx)] = translatedText
+	}
+	return cells, rows.Err()
+}
+
+// CompleteCSVCheckpoint marks a checkpoint as completed.
+func (s *Store) CompleteCSVCheckpoint(ctx context.Context, checkpointID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE csv_checkpoints SET status = 'completed', updated_at = ? WHERE id = ?`,
+		time.Now(), checkpointID)
+	return err
 }
 
 func (s *Store) Close() error {
