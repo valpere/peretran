@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/valpere/peretran/internal/postprocess"
 )
 
 var DefaultOllamaModels = []string{
@@ -119,7 +120,7 @@ Translation:`, sourceLang, req.TargetLang, req.Text)
 		return result, err
 	}
 
-	result.TranslatedText = strings.TrimSpace(ollamaResp.Response)
+	result.TranslatedText = postprocess.Clean(ollamaResp.Response)
 	result.Confidence = 0.7
 	result.Metadata = map[string]string{"model": model}
 

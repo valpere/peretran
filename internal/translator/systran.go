@@ -54,7 +54,7 @@ func (s *SystranService) Translate(ctx context.Context, cfg ServiceConfig, req T
 		return result, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "https://api-systran-systran-translation-v1.p.rapidapi.com/translation/text/translate", "POST", bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api-systran-systran-translation-v1.p.rapidapi.com/translation/text/translate", bytes.NewBuffer(jsonData))
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create request: %v", err)
 		return result, err
