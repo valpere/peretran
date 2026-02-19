@@ -19,18 +19,18 @@ This project implements proven approaches from TranslateBooksWithLLMs and book-t
    - **Stage 2 (Refinement):** LLM literary editor reviews and improves the draft for fluency and idiomatic quality
    - Separates concerns: accuracy in stage 1, fluency in stage 2
 
-2. **Adaptive Systems - Dynamic Context Management** *(Phase 6 — not yet implemented)*
-   - Start with small context, increase when truncation detected
-   - Handle context overflow with chunk reduction
-   - Track token usage for optimization
+2. **Adaptive Systems - Text Chunking with Sliding Context** *(Phase 6)*
+   - Split large texts into chunks at paragraph/sentence/word boundaries (`--chunk-size`)
+   - Pass last ~25 words of each chunk's translation to the next as `PreviousContext`
+   - Maintains narrative continuity across chunk boundaries
 
-3. **Structure Preservation - Placeholder System** *(Phase 6 — not yet implemented)*
-   - For structured content (HTML, Markdown): protect tags with placeholders
-   - Validate and restore after translation
+3. **Structure Preservation - Placeholder System** *(Phase 6)*
+   - For structured content (HTML, Markdown): protect tags with `[PHn]` placeholders (`--placeholder`)
+   - Validate and restore after translation; warn on missing markers
 
-4. **Continuity - Context Sliding** *(Phase 6 — not yet implemented)*
-   - Pass previous translation context to next chunk
-   - Maintain paragraph flow across chunks
+4. **Terminology Glossary** *(Phase 6)*
+   - Manage source→target term mappings via `peretran glossary list/add/delete`
+   - Inject glossary into LLM prompts for consistent translation (`--glossary`)
 
 5. **Engineering Rigor**
    - **Translation memory:** SQLite cache; instant retrieval of repeated translations
@@ -70,7 +70,11 @@ peretran/
 │   │   ├── refiner.go   # Refiner interface
 │   │   └── ollama.go    # OllamaRefiner implementation
 │   ├── store/           # SQLite storage and caching
-│   │   └── store.go     # Store with translation_memory, stage1_cache tables
+│   │   └── store.go     # Store with translation_memory, stage1_cache, glossary tables
+│   ├── placeholder/     # HTML/Markdown tag protection (Phase 6)
+│   │   └── placeholder.go  # Protect/Restore/Validate/InstructionHint
+│   ├── chunker/         # Text chunking with sliding context (Phase 6)
+│   │   └── chunker.go   # Chunk/ExtractContext
 │   ├── detector/        # language detection (lingua-go)
 │   └── markdown/        # markdown utilities (gomarkdown)
 ├── docs/
@@ -112,11 +116,20 @@ make build
 # CSV translation - specific columns (0-indexed)
 ./peretran translate csv -i data.csv -o translated.csv -t uk -l 1 -l 3
 
+# Phase 6: fuzzy cache + placeholder protection + chunking + glossary
+./peretran translate -i input.txt -o output.txt -t uk \
+  --fuzzy-threshold 0.85 --placeholder --chunk-size 2000 --glossary
+
 # Cache management
 ./peretran cache stats
 ./peretran cache list
 ./peretran cache delete <id>
 ./peretran cache clear
+
+# Glossary management
+./peretran glossary list
+./peretran glossary add "Kyiv" "Київ" --source en --target uk
+./peretran glossary delete <id>
 ```
 
 ### Test
@@ -150,12 +163,16 @@ go vet ./...
 | `cmd/translate.go` | translate subcommand — parallel services, arbiter, refiner, cache |
 | `cmd/csv.go` | translate csv subcommand — per-cell translation with column selection |
 | `cmd/cache.go` | cache subcommand — list, stats, delete, clear |
+| `cmd/glossary.go` | glossary subcommand — list, add, delete |
 | `cmd/common.go` | `buildServices()` helper; default Ollama and OpenRouter model lists |
 | `internal/translator/service.go` | `TranslationService` interface |
+| `internal/translator/types.go` | `TranslateRequest` (Text, PreviousContext, GlossaryTerms, Instructions) |
 | `internal/orchestrator/orchestrator.go` | parallel service execution |
 | `internal/arbiter/ollama.go` | LLM-based translation evaluation/composition |
 | `internal/refiner/ollama.go` | Stage 2 literary editor prompt and cleanup |
-| `internal/store/store.go` | SQLite: `translation_memory`, `stage1_cache`, `translation_results` |
+| `internal/store/store.go` | SQLite: `translation_memory`, `stage1_cache`, `glossary` tables |
+| `internal/placeholder/placeholder.go` | Protect/Restore HTML and Markdown tags with `[PHn]` markers |
+| `internal/chunker/chunker.go` | Chunk large texts; ExtractContext for sliding-window continuity |
 | `internal/detector/detector.go` | source language auto-detection |
 
 ## Translation Flow
@@ -196,7 +213,7 @@ Check translation_memory (exact-match cache, NFC-normalized)
 | 4 | Two-pass refinement (`--refine`), stage1_cache | ✅ Done |
 | 5a | Cache management CLI (`peretran cache`) | ✅ Done |
 | 5b | CSV translation (`peretran translate csv`) | ✅ Done |
-| 6 | Adaptive context, placeholder system, fuzzy matching | ⏳ Planned |
+| 6 | Chunking, placeholder system, fuzzy matching, glossary | ✅ Done |
 
 ## Language Version
 
