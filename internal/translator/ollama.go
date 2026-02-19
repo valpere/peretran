@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/valpere/peretran/internal/postprocess"
@@ -72,12 +73,7 @@ func (s *OllamaTranslator) Translate(ctx context.Context, cfg ServiceConfig, req
 		sourceLang = "detect"
 	}
 
-	prompt := fmt.Sprintf(`Translate the following text from %s to %s.
-Only respond with the translation, nothing else.
-
-Text: "%s"
-
-Translation:`, sourceLang, req.TargetLang, req.Text)
+	prompt := buildOllamaPrompt(sourceLang, req.TargetLang, req.Text, req.PreviousContext, req.GlossaryTerms, req.Instructions)
 
 	ollamaReq := map[string]interface{}{
 		"model":  model,
@@ -146,4 +142,34 @@ func (s *OllamaTranslator) SupportedLanguages(ctx context.Context) ([]string, er
 
 func (s *OllamaTranslator) GetModels() []string {
 	return s.models
+}
+
+// buildOllamaPrompt constructs the Ollama translation prompt, optionally
+// prepending glossary terms, a sliding-window context, and extra instructions.
+func buildOllamaPrompt(sourceLang, targetLang, text, previousContext string, glossary map[string]string, instructions string) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("Translate the following text from %s to %s.\n", sourceLang, targetLang))
+	sb.WriteString("Only respond with the translation, nothing else.")
+
+	if instructions != "" {
+		sb.WriteString(" ")
+		sb.WriteString(instructions)
+	}
+	sb.WriteString("\n\n")
+
+	if len(glossary) > 0 {
+		sb.WriteString("TERMINOLOGY (use these exact translations):\n")
+		for src, tgt := range glossary {
+			sb.WriteString(fmt.Sprintf("  %s → %s\n", src, tgt))
+		}
+		sb.WriteString("\n")
+	}
+
+	if previousContext != "" {
+		sb.WriteString(fmt.Sprintf("CONTEXT (previous passage for continuity — do NOT retranslate this):\n...%s\n\n", previousContext))
+	}
+
+	sb.WriteString(fmt.Sprintf("Text: \"%s\"\n\nTranslation:", text))
+	return sb.String()
 }

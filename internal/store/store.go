@@ -115,10 +115,22 @@ func (s *Store) migrate() error {
 		FOREIGN KEY (checkpoint_id) REFERENCES csv_checkpoints(id)
 	);
 
+	-- glossary stores user-defined terminology for consistent translation of specific terms
+	CREATE TABLE IF NOT EXISTS glossary (
+		id TEXT PRIMARY KEY,
+		source_lang TEXT NOT NULL,
+		target_lang TEXT NOT NULL,
+		source_term TEXT NOT NULL,
+		target_term TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(source_lang, target_lang, source_term)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_memory_lookup ON translation_memory(source_text, source_lang, target_lang);
 	CREATE INDEX IF NOT EXISTS idx_stage1_lookup ON stage1_cache(source_text, source_lang, target_lang);
 	CREATE INDEX IF NOT EXISTS idx_results_request ON translation_results(request_id);
 	CREATE INDEX IF NOT EXISTS idx_checkpoint_cells ON csv_checkpoint_cells(checkpoint_id);
+	CREATE INDEX IF NOT EXISTS idx_glossary_lookup ON glossary(source_lang, target_lang);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -371,4 +383,208 @@ func (s *Store) Close() error {
 // for consistent cache key comparison.
 func normalizeText(text string) string {
 	return norm.NFC.String(strings.TrimSpace(text))
+}
+
+// levenshtein returns the edit distance between two strings (rune-aware).
+// Uses a space-optimized two-row DP implementation.
+func levenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := range prev {
+		prev[j] = j
+	}
+
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			if ra[i-1] == rb[j-1] {
+				curr[j] = prev[j-1]
+			} else {
+				min := prev[j]
+				if prev[j-1] < min {
+					min = prev[j-1]
+				}
+				if curr[j-1] < min {
+					min = curr[j-1]
+				}
+				curr[j] = min + 1
+			}
+		}
+		prev, curr = curr, prev
+	}
+
+	return prev[lb]
+}
+
+// stringSimilarity returns a similarity score in [0, 1] (1 = identical).
+func stringSimilarity(a, b string) float64 {
+	if a == b {
+		return 1.0
+	}
+	la, lb := len([]rune(a)), len([]rune(b))
+	maxLen := la
+	if lb > maxLen {
+		maxLen = lb
+	}
+	if maxLen == 0 {
+		return 1.0
+	}
+	return 1.0 - float64(levenshtein(a, b))/float64(maxLen)
+}
+
+// FuzzyGetCachedTranslation returns a cached translation whose normalised source
+// text has at least threshold similarity (0–1) to sourceText. Pass threshold ≤ 0
+// to disable (always returns "", false, nil). To avoid O(n²) cost, texts longer
+// than 1 000 runes are not fuzzy-matched.
+func (s *Store) FuzzyGetCachedTranslation(ctx context.Context, sourceText, sourceLang, targetLang string, threshold float64) (string, bool, error) {
+	if threshold <= 0 {
+		return "", false, nil
+	}
+
+	normalized := normalizeText(sourceText)
+	const maxFuzzyRunes = 1000
+	if len([]rune(normalized)) > maxFuzzyRunes {
+		return "", false, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT source_text, final_text FROM translation_memory
+		 WHERE source_lang = ? AND target_lang = ? AND NOT invalidated`,
+		sourceLang, targetLang)
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+
+	var bestFinal string
+	bestScore := 0.0
+
+	for rows.Next() {
+		var srcText, finalText string
+		if err := rows.Scan(&srcText, &finalText); err != nil {
+			return "", false, err
+		}
+
+		// Quick length pre-filter: if the length difference alone makes it
+		// impossible to reach the threshold, skip the expensive edit distance.
+		ls, lr := len([]rune(normalized)), len([]rune(srcText))
+		maxL := ls
+		if lr > maxL {
+			maxL = lr
+		}
+		diff := ls - lr
+		if diff < 0 {
+			diff = -diff
+		}
+		if maxL > 0 && 1.0-float64(diff)/float64(maxL) < threshold {
+			continue
+		}
+
+		score := stringSimilarity(normalized, srcText)
+		if score >= threshold && score > bestScore {
+			bestScore = score
+			bestFinal = finalText
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+
+	if bestFinal != "" {
+		return bestFinal, true, nil
+	}
+	return "", false, nil
+}
+
+// GlossaryEntry represents a row in the glossary table.
+type GlossaryEntry struct {
+	ID         string
+	SourceLang string
+	TargetLang string
+	SourceTerm string
+	TargetTerm string
+	CreatedAt  time.Time
+}
+
+// AddGlossaryTerm inserts or replaces a glossary entry.
+func (s *Store) AddGlossaryTerm(ctx context.Context, sourceLang, targetLang, sourceTerm, targetTerm string) error {
+	id := fmt.Sprintf("gl_%d", time.Now().UnixNano())
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO glossary (id, source_lang, target_lang, source_term, target_term)
+		 VALUES (?, ?, ?, ?, ?)`,
+		id, sourceLang, targetLang, sourceTerm, targetTerm)
+	return err
+}
+
+// GetGlossaryTerms returns all active glossary terms for a language pair as a
+// source-term → target-term map, ready to embed in a translation prompt.
+func (s *Store) GetGlossaryTerms(ctx context.Context, sourceLang, targetLang string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT source_term, target_term FROM glossary WHERE source_lang = ? AND target_lang = ?`,
+		sourceLang, targetLang)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	terms := make(map[string]string)
+	for rows.Next() {
+		var src, tgt string
+		if err := rows.Scan(&src, &tgt); err != nil {
+			return nil, err
+		}
+		terms[src] = tgt
+	}
+	return terms, rows.Err()
+}
+
+// ListGlossaryTerms returns all glossary entries, optionally filtered by language
+// pair (pass empty strings to return everything).
+func (s *Store) ListGlossaryTerms(ctx context.Context, sourceLang, targetLang string) ([]GlossaryEntry, error) {
+	query := `SELECT id, source_lang, target_lang, source_term, target_term, created_at FROM glossary`
+	var args []interface{}
+
+	switch {
+	case sourceLang != "" && targetLang != "":
+		query += ` WHERE source_lang = ? AND target_lang = ?`
+		args = append(args, sourceLang, targetLang)
+	case sourceLang != "":
+		query += ` WHERE source_lang = ?`
+		args = append(args, sourceLang)
+	case targetLang != "":
+		query += ` WHERE target_lang = ?`
+		args = append(args, targetLang)
+	}
+	query += ` ORDER BY source_lang, target_lang, source_term`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []GlossaryEntry
+	for rows.Next() {
+		var e GlossaryEntry
+		if err := rows.Scan(&e.ID, &e.SourceLang, &e.TargetLang, &e.SourceTerm, &e.TargetTerm, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// DeleteGlossaryTerm removes a glossary entry by ID.
+func (s *Store) DeleteGlossaryTerm(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM glossary WHERE id = ?`, id)
+	return err
 }

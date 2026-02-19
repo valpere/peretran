@@ -27,6 +27,7 @@ import (
 	"github.com/valpere/peretran/internal/arbiter"
 	"github.com/valpere/peretran/internal/detector"
 	"github.com/valpere/peretran/internal/orchestrator"
+	"github.com/valpere/peretran/internal/placeholder"
 	"github.com/valpere/peretran/internal/refiner"
 	"github.com/valpere/peretran/internal/store"
 	"github.com/valpere/peretran/internal/translator"
@@ -59,6 +60,11 @@ var (
 	csvDBPath     string
 	csvNoCache    bool
 	csvResume     string
+
+	// Phase 6 flags
+	csvFuzzyThreshold float64
+	csvUsePlaceholder bool
+	csvUseGlossary    bool
 )
 
 var csvCmd = &cobra.Command{
@@ -145,6 +151,23 @@ Example:
 			}
 		}
 
+		// Load glossary once for the entire run.
+		var glossaryTerms map[string]string
+		if csvUseGlossary && db != nil {
+			glossaryTerms, err = db.GetGlossaryTerms(ctx, srcLang, csvTargetLang)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load glossary: %v\n", err)
+			} else if len(glossaryTerms) > 0 {
+				fmt.Fprintf(os.Stderr, "Loaded %d glossary terms\n", len(glossaryTerms))
+			}
+		}
+
+		// Placeholder hint for LLM prompts (used if --placeholder is active).
+		phHint := ""
+		if csvUsePlaceholder {
+			phHint = placeholder.InstructionHint()
+		}
+
 		serviceList, err := buildServices(csvServices, csvOllamaURL, csvOpenrouterKey, csvSystranKey, csvMymemoryEmail, csvOllamaModels, csvOpenrouterModels)
 		if err != nil {
 			return err
@@ -187,7 +210,7 @@ Example:
 					continue
 				}
 
-				// Check translation memory cache.
+				// Check translation memory cache (exact match).
 				if db != nil {
 					if cached, found, cacheErr := db.GetCachedTranslation(ctx, cell, srcLang, csvTargetLang); cacheErr == nil && found {
 						out[rowIdx][colIdx] = cached
@@ -198,10 +221,30 @@ Example:
 					}
 				}
 
+				// Fuzzy cache check.
+				if csvFuzzyThreshold > 0 && db != nil {
+					if cached, found, cacheErr := db.FuzzyGetCachedTranslation(ctx, cell, srcLang, csvTargetLang, csvFuzzyThreshold); cacheErr == nil && found {
+						out[rowIdx][colIdx] = cached
+						if checkpointID != "" {
+							_ = db.SaveCSVCell(ctx, checkpointID, rowIdx, colIdx, cached)
+						}
+						continue
+					}
+				}
+
+				// Placeholder protection per cell.
+				cellToTranslate := cell
+				var phMarkers []string
+				if csvUsePlaceholder {
+					cellToTranslate, phMarkers = placeholder.Protect(cell)
+				}
+
 				req := translator.TranslateRequest{
-					Text:       cell,
-					SourceLang: srcLang,
-					TargetLang: csvTargetLang,
+					Text:          cellToTranslate,
+					SourceLang:    srcLang,
+					TargetLang:    csvTargetLang,
+					GlossaryTerms: glossaryTerms,
+					Instructions:  phHint,
 				}
 
 				result := orch.Execute(ctx, cfg, req)
@@ -214,7 +257,7 @@ Example:
 
 				if csvUseArbiter && len(result.Results) > 1 {
 					arb := arbiter.NewOllamaArbiter(csvArbiterModel, csvArbiterURL)
-					eval, arbErr := arb.Evaluate(ctx, cell, srcLang, csvTargetLang, result.Results)
+					eval, arbErr := arb.Evaluate(ctx, cellToTranslate, srcLang, csvTargetLang, result.Results)
 					if arbErr != nil {
 						fmt.Fprintf(os.Stderr, "Arbiter failed row %d col %d: %v\n", rowIdx, colIdx, arbErr)
 					} else {
@@ -224,12 +267,17 @@ Example:
 
 				if csvUseRefine {
 					ref := refiner.NewOllamaRefiner(csvRefinerModel, csvRefinerURL)
-					refined, refErr := ref.Refine(ctx, srcLang, csvTargetLang, cell, translated)
+					refined, refErr := ref.Refine(ctx, srcLang, csvTargetLang, cellToTranslate, translated)
 					if refErr != nil {
 						fmt.Fprintf(os.Stderr, "Refiner failed row %d col %d: %v\n", rowIdx, colIdx, refErr)
 					} else {
 						translated = refined
 					}
+				}
+
+				// Restore placeholders.
+				if csvUsePlaceholder && len(phMarkers) > 0 {
+					translated = placeholder.Restore(translated, phMarkers)
 				}
 
 				out[rowIdx][colIdx] = translated
@@ -300,6 +348,11 @@ func init() {
 	csvCmd.Flags().StringVar(&csvDBPath, "db", "./data/peretran.db", "Database path for translation memory and checkpoints")
 	csvCmd.Flags().BoolVar(&csvNoCache, "no-cache", false, "Disable translation memory cache and checkpoints")
 	csvCmd.Flags().StringVar(&csvResume, "resume", "", "Resume from checkpoint ID (printed at start of original run)")
+
+	// Phase 6 flags
+	csvCmd.Flags().Float64Var(&csvFuzzyThreshold, "fuzzy-threshold", 0, "Fuzzy cache similarity threshold (0 to disable, e.g. 0.85)")
+	csvCmd.Flags().BoolVar(&csvUsePlaceholder, "placeholder", false, "Protect HTML/Markdown markup with placeholders during translation")
+	csvCmd.Flags().BoolVar(&csvUseGlossary, "glossary", false, "Load terminology glossary from database for LLM services")
 
 	csvCmd.MarkFlagRequired("input")
 	csvCmd.MarkFlagRequired("output")
