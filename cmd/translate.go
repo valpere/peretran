@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,8 +28,10 @@ import (
 
 	"github.com/valpere/peretran/internal"
 	"github.com/valpere/peretran/internal/arbiter"
+	"github.com/valpere/peretran/internal/chunker"
 	"github.com/valpere/peretran/internal/detector"
 	"github.com/valpere/peretran/internal/orchestrator"
+	"github.com/valpere/peretran/internal/placeholder"
 	"github.com/valpere/peretran/internal/refiner"
 	"github.com/valpere/peretran/internal/store"
 	"github.com/valpere/peretran/internal/translator"
@@ -47,9 +50,9 @@ var (
 	arbiterModel string
 	arbiterURL   string
 
-	ollamaURL      string
-	ollamaModels   []string
-	openrouterKey  string
+	ollamaURL        string
+	ollamaModels     []string
+	openrouterKey    string
 	openrouterModels []string
 
 	systranKey    string
@@ -62,6 +65,12 @@ var (
 	useRefine    bool
 	refinerModel string
 	refinerURL   string
+
+	// Phase 6 flags
+	fuzzyThreshold float64
+	usePlaceholder bool
+	chunkSize      int
+	useGlossary    bool
 )
 
 var translateCmd = &cobra.Command{
@@ -80,7 +89,13 @@ Available services:
 Use multiple services: --services google,ollama,openrouter
 
 Two-pass translation:
-  --refine      Enable Stage 2 literary refinement pass`,
+  --refine      Enable Stage 2 literary refinement pass
+
+Phase 6 options:
+  --fuzzy-threshold  Fuzzy cache matching (0 to disable, e.g. 0.85)
+  --placeholder      Protect HTML/Markdown markup during translation
+  --chunk-size       Split large texts into chunks of N characters
+  --glossary         Load terminology glossary from database`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if inputFile == outputFile {
 			return fmt.Errorf("input file and output file cannot be the same")
@@ -95,7 +110,7 @@ Two-pass translation:
 
 		ctx := context.Background()
 
-		// Auto-detect source language when not specified
+		// Auto-detect source language when not specified.
 		if sourceLang == "auto" {
 			det := detector.New()
 			if detected, ok := det.DetectISO(text); ok {
@@ -112,17 +127,47 @@ Two-pass translation:
 			}
 			defer db.Close()
 
+			// Exact cache check.
 			if cached, found, cacheErr := db.GetCachedTranslation(ctx, text, sourceLang, targetLang); cacheErr == nil && found {
 				fmt.Fprintf(os.Stderr, "Using cached translation\n")
-				if err := os.MkdirAll(filepath.Dir(outputFile), 0755); err != nil {
-					return fmt.Errorf("failed to create output directory: %w", err)
-				}
-				if err := os.WriteFile(outputFile, []byte(cached), 0644); err != nil {
-					return fmt.Errorf("failed to write output file: %w", err)
-				}
-				fmt.Printf("Successfully translated %s to %s (from cache)\n", sourceLang, targetLang)
-				return nil
+				return writeOutput(outputFile, cached, sourceLang, targetLang, true)
 			}
+
+			// Fuzzy cache check.
+			if fuzzyThreshold > 0 {
+				if cached, found, cacheErr := db.FuzzyGetCachedTranslation(ctx, text, sourceLang, targetLang, fuzzyThreshold); cacheErr == nil && found {
+					fmt.Fprintf(os.Stderr, "Using fuzzy-matched cached translation\n")
+					return writeOutput(outputFile, cached, sourceLang, targetLang, true)
+				}
+			}
+		}
+
+		// Load glossary from DB.
+		var glossaryTerms map[string]string
+		if useGlossary && db != nil {
+			glossaryTerms, err = db.GetGlossaryTerms(ctx, sourceLang, targetLang)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load glossary: %v\n", err)
+			} else if len(glossaryTerms) > 0 {
+				fmt.Fprintf(os.Stderr, "Loaded %d glossary terms\n", len(glossaryTerms))
+			}
+		}
+
+		// Placeholder protection.
+		var phMarkers []string
+		phHint := ""
+		if usePlaceholder {
+			text, phMarkers = placeholder.Protect(text)
+			if len(phMarkers) > 0 {
+				phHint = placeholder.InstructionHint()
+				fmt.Fprintf(os.Stderr, "Placeholder protection: %d markers\n", len(phMarkers))
+			}
+		}
+
+		// Split into chunks if requested.
+		chunks := chunker.Chunk(text, chunkSize)
+		if len(chunks) > 1 {
+			fmt.Fprintf(os.Stderr, "Splitting into %d chunks (max %d chars each)\n", len(chunks), chunkSize)
 		}
 
 		cfg := translator.ServiceConfig{
@@ -141,95 +186,124 @@ Two-pass translation:
 			MaxAttempts: maxRetries,
 		})
 
-		req := translator.TranslateRequest{
-			Text:       text,
-			SourceLang: sourceLang,
-			TargetLang: targetLang,
-		}
+		// Translate all chunks sequentially with sliding context.
+		var translatedChunks []string
+		previousContext := ""
 
-		// Stage 1: parallel translation
-		result := orch.Execute(ctx, cfg, req)
+		for i, chunk := range chunks {
+			if len(chunks) > 1 {
+				fmt.Fprintf(os.Stderr, "Translating chunk %d/%d...\n", i+1, len(chunks))
+			}
 
-		if result.Succeeded == 0 {
-			return fmt.Errorf("all translation services failed")
-		}
+			req := translator.TranslateRequest{
+				Text:            chunk,
+				SourceLang:      sourceLang,
+				TargetLang:      targetLang,
+				PreviousContext: previousContext,
+				GlossaryTerms:   glossaryTerms,
+				Instructions:    phHint,
+			}
 
-		var draftText string
-		var selectedService string
-		var isComposite bool
-		var arbiterReasoning string
+			// Stage 1: parallel translation.
+			result := orch.Execute(ctx, cfg, req)
+			if result.Succeeded == 0 {
+				return fmt.Errorf("all translation services failed (chunk %d)", i+1)
+			}
 
-		if useArbiter && len(result.Results) > 1 {
-			arb := arbiter.NewOllamaArbiter(arbiterModel, arbiterURL)
-			evalResult, err := arb.Evaluate(ctx, text, sourceLang, targetLang, result.Results)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Arbiter failed: %v, using first result\n", err)
+			var draftText string
+			var selectedService string
+			var isComposite bool
+			var arbiterReasoning string
+
+			if useArbiter && len(result.Results) > 1 {
+				arb := arbiter.NewOllamaArbiter(arbiterModel, arbiterURL)
+				evalResult, evalErr := arb.Evaluate(ctx, chunk, sourceLang, targetLang, result.Results)
+				if evalErr != nil {
+					fmt.Fprintf(os.Stderr, "Arbiter failed: %v, using first result\n", evalErr)
+					draftText = result.Results[0].TranslatedText
+					selectedService = result.Results[0].ServiceName
+				} else {
+					draftText = evalResult.CompositeText
+					selectedService = evalResult.SelectedService
+					isComposite = evalResult.IsComposite
+					arbiterReasoning = evalResult.Reasoning
+					fmt.Fprintf(os.Stderr, "Arbiter selected: %s\n", evalResult.SelectedService)
+				}
+			} else {
 				draftText = result.Results[0].TranslatedText
 				selectedService = result.Results[0].ServiceName
-			} else {
-				draftText = evalResult.CompositeText
-				selectedService = evalResult.SelectedService
-				isComposite = evalResult.IsComposite
-				arbiterReasoning = evalResult.Reasoning
-				fmt.Fprintf(os.Stderr, "Arbiter selected: %s\n", evalResult.SelectedService)
-			}
-		} else {
-			draftText = result.Results[0].TranslatedText
-			selectedService = result.Results[0].ServiceName
-		}
-
-		// Stage 2: optional literary refinement pass
-		finalText := draftText
-		if useRefine {
-			fmt.Fprintf(os.Stderr, "Running Stage 2 refinement...\n")
-			ref := refiner.NewOllamaRefiner(refinerModel, refinerURL)
-			refined, err := ref.Refine(ctx, sourceLang, targetLang, text, draftText)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Refiner failed: %v, using draft\n", err)
-			} else {
-				finalText = refined
-				fmt.Fprintf(os.Stderr, "Refinement complete\n")
-			}
-		}
-
-		if db != nil && !noCache {
-			reqID := uuid.New().String()
-			memReq := internal.TranslationRequest{
-				ID:         reqID,
-				SourceText: text,
-				SourceLang: sourceLang,
-				TargetLang: targetLang,
-				Timestamp:  time.Now(),
-			}
-			_ = db.SaveRequest(ctx, memReq)
-
-			for _, r := range result.Results {
-				_ = db.SaveResult(ctx, reqID, r.ServiceName, r.TranslatedText, r.Confidence, int(r.Latency.Milliseconds()), r.Error)
 			}
 
-			_ = db.SaveFinalTranslation(ctx, reqID, selectedService, finalText, isComposite, arbiterReasoning)
-			// Store both the final and draft (stage1) text in translation memory
-			_ = db.SaveToMemory(ctx, text, sourceLang, targetLang, finalText, draftText, selectedService)
+			// Stage 2: optional literary refinement.
+			chunkTranslation := draftText
 			if useRefine {
-				_ = db.SaveToStage1Cache(ctx, text, sourceLang, targetLang, draftText, selectedService)
+				fmt.Fprintf(os.Stderr, "Running Stage 2 refinement (chunk %d)...\n", i+1)
+				ref := refiner.NewOllamaRefiner(refinerModel, refinerURL)
+				refined, refErr := ref.Refine(ctx, sourceLang, targetLang, chunk, draftText)
+				if refErr != nil {
+					fmt.Fprintf(os.Stderr, "Refiner failed: %v, using draft\n", refErr)
+				} else {
+					chunkTranslation = refined
+				}
+			}
+
+			// Update sliding context for the next chunk.
+			previousContext = chunker.ExtractContext(chunkTranslation, chunker.DefaultContextWords)
+
+			translatedChunks = append(translatedChunks, chunkTranslation)
+
+			// Persist chunk result to cache and DB.
+			if db != nil && !noCache && len(chunks) == 1 {
+				// Only save single-chunk translations to full-text cache.
+				reqID := uuid.New().String()
+				memReq := internal.TranslationRequest{
+					ID:         reqID,
+					SourceText: string(strInp),
+					SourceLang: sourceLang,
+					TargetLang: targetLang,
+					Timestamp:  time.Now(),
+				}
+				_ = db.SaveRequest(ctx, memReq)
+				for _, r := range result.Results {
+					_ = db.SaveResult(ctx, reqID, r.ServiceName, r.TranslatedText, r.Confidence, int(r.Latency.Milliseconds()), r.Error)
+				}
+				_ = db.SaveFinalTranslation(ctx, reqID, selectedService, chunkTranslation, isComposite, arbiterReasoning)
+				_ = db.SaveToMemory(ctx, string(strInp), sourceLang, targetLang, chunkTranslation, draftText, selectedService)
+				if useRefine {
+					_ = db.SaveToStage1Cache(ctx, string(strInp), sourceLang, targetLang, draftText, selectedService)
+				}
 			}
 		}
 
-		if err := os.MkdirAll(filepath.Dir(outputFile), 0755); err != nil {
-			return fmt.Errorf("failed to create output directory: %w", err)
+		// Join chunk translations.
+		finalText := strings.Join(translatedChunks, "\n\n")
+
+		// Restore placeholders.
+		if usePlaceholder && len(phMarkers) > 0 {
+			finalText = placeholder.Restore(finalText, phMarkers)
+			if missing := placeholder.Validate(finalText, phMarkers); len(missing) > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: %d placeholder(s) missing after translation: %v\n", len(missing), missing)
+			}
 		}
 
-		if err := os.WriteFile(outputFile, []byte(finalText), 0644); err != nil {
-			return fmt.Errorf("failed to write output file: %w", err)
-		}
-
-		fmt.Printf("Successfully translated %s to %s\n", sourceLang, targetLang)
-		fmt.Printf("Services used: %d/%d\n", result.Succeeded, len(services))
-		if useRefine {
-			fmt.Printf("Stage 2 refinement applied\n")
-		}
-		return nil
+		return writeOutput(outputFile, finalText, sourceLang, targetLang, false)
 	},
+}
+
+// writeOutput writes the translated text to outputFile and prints a summary.
+func writeOutput(outputFile, text, sourceLang, targetLang string, fromCache bool) error {
+	if err := os.MkdirAll(filepath.Dir(outputFile), 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+	if err := os.WriteFile(outputFile, []byte(text), 0644); err != nil {
+		return fmt.Errorf("failed to write output file: %w", err)
+	}
+	if fromCache {
+		fmt.Printf("Successfully translated %s to %s (from cache)\n", sourceLang, targetLang)
+	} else {
+		fmt.Printf("Successfully translated %s to %s\n", sourceLang, targetLang)
+	}
+	return nil
 }
 
 func init() {
@@ -261,6 +335,12 @@ func init() {
 	translateCmd.Flags().StringVar(&dbPath, "db", "./data/peretran.db", "Database path for translation memory")
 	translateCmd.Flags().BoolVar(&noCache, "no-cache", false, "Disable translation memory cache")
 	translateCmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Total attempts per service including the first (1 = no retries)")
+
+	// Phase 6 flags
+	translateCmd.Flags().Float64Var(&fuzzyThreshold, "fuzzy-threshold", 0, "Fuzzy cache similarity threshold (0 to disable, e.g. 0.85)")
+	translateCmd.Flags().BoolVar(&usePlaceholder, "placeholder", false, "Protect HTML/Markdown markup with placeholders during translation")
+	translateCmd.Flags().IntVar(&chunkSize, "chunk-size", 0, "Split input into chunks of N characters (0 = no chunking)")
+	translateCmd.Flags().BoolVar(&useGlossary, "glossary", false, "Load terminology glossary from database for LLM services")
 
 	translateCmd.MarkFlagRequired("input")
 	translateCmd.MarkFlagRequired("output")

@@ -459,3 +459,234 @@ func TestStore_MultipleLanguagePairs(t *testing.T) {
 	}
 }
 
+// --- Fuzzy matching tests ---
+
+func TestStore_FuzzyGetCachedTranslation_Disabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.SaveToMemory(context.Background(), "Hello world", "en", "uk", "Привіт світ", "", "google")
+
+	text, found, err := s.FuzzyGetCachedTranslation(context.Background(), "Hello world", "en", "uk", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Error("expected not found when threshold=0 (disabled)")
+	}
+	_ = text
+}
+
+func TestStore_FuzzyGetCachedTranslation_ExactMatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.SaveToMemory(context.Background(), "Hello world", "en", "uk", "Привіт світ", "", "google")
+
+	text, found, err := s.FuzzyGetCachedTranslation(context.Background(), "Hello world", "en", "uk", 0.85)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("expected found for exact match via fuzzy")
+	}
+	if text != "Привіт світ" {
+		t.Errorf("expected 'Привіт світ', got %q", text)
+	}
+}
+
+func TestStore_FuzzyGetCachedTranslation_NearMatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	// "Hello world!" vs "Hello world" — edit distance 1, max_len 12, similarity ~0.917
+	s.SaveToMemory(context.Background(), "Hello world!", "en", "uk", "Привіт, світ!", "", "google")
+
+	// Same text with minor punctuation difference — should match at 0.85 threshold
+	text, found, err := s.FuzzyGetCachedTranslation(context.Background(), "Hello world", "en", "uk", 0.85)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("expected fuzzy match for near-identical text")
+	}
+	if text != "Привіт, світ!" {
+		t.Errorf("expected 'Привіт, світ!', got %q", text)
+	}
+}
+
+func TestStore_FuzzyGetCachedTranslation_TooLowSimilarity(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.SaveToMemory(context.Background(), "The quick brown fox", "en", "uk", "Швидка руда лисиця", "", "google")
+
+	// Completely different text — should not match
+	_, found, err := s.FuzzyGetCachedTranslation(context.Background(), "Hello world", "en", "uk", 0.85)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Error("expected not found for text with low similarity")
+	}
+}
+
+func TestLevenshtein(t *testing.T) {
+	tests := []struct {
+		a, b     string
+		expected int
+	}{
+		{"", "", 0},
+		{"abc", "", 3},
+		{"", "abc", 3},
+		{"abc", "abc", 0},
+		{"abc", "abd", 1},
+		{"kitten", "sitting", 3},
+		{"Hello", "Hello, world!", 8},
+	}
+
+	for _, tt := range tests {
+		result := levenshtein(tt.a, tt.b)
+		if result != tt.expected {
+			t.Errorf("levenshtein(%q, %q) = %d, want %d", tt.a, tt.b, result, tt.expected)
+		}
+	}
+}
+
+func TestStringSimilarity(t *testing.T) {
+	tests := []struct {
+		a, b     string
+		minScore float64
+		maxScore float64
+	}{
+		{"", "", 1.0, 1.0},
+		{"abc", "abc", 1.0, 1.0},
+		{"Hello world", "Hello world", 1.0, 1.0},
+		{"Hello world", "Hello, world!", 0.80, 0.99}, // minor punctuation difference
+		{"abc", "xyz", 0.0, 0.1},                     // totally different
+	}
+
+	for _, tt := range tests {
+		score := stringSimilarity(tt.a, tt.b)
+		if score < tt.minScore || score > tt.maxScore {
+			t.Errorf("stringSimilarity(%q, %q) = %f, want in [%f, %f]", tt.a, tt.b, score, tt.minScore, tt.maxScore)
+		}
+	}
+}
+
+// --- Glossary tests ---
+
+func TestStore_AddAndGetGlossaryTerms(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	err := s.AddGlossaryTerm(context.Background(), "en", "uk", "Kyiv", "Київ")
+	if err != nil {
+		t.Fatalf("AddGlossaryTerm failed: %v", err)
+	}
+	err = s.AddGlossaryTerm(context.Background(), "en", "uk", "Ukraine", "Україна")
+	if err != nil {
+		t.Fatalf("AddGlossaryTerm failed: %v", err)
+	}
+
+	terms, err := s.GetGlossaryTerms(context.Background(), "en", "uk")
+	if err != nil {
+		t.Fatalf("GetGlossaryTerms failed: %v", err)
+	}
+	if len(terms) != 2 {
+		t.Errorf("expected 2 terms, got %d", len(terms))
+	}
+	if terms["Kyiv"] != "Київ" {
+		t.Errorf("expected 'Київ' for 'Kyiv', got %q", terms["Kyiv"])
+	}
+	if terms["Ukraine"] != "Україна" {
+		t.Errorf("expected 'Україна' for 'Ukraine', got %q", terms["Ukraine"])
+	}
+}
+
+func TestStore_GetGlossaryTerms_Empty(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	terms, err := s.GetGlossaryTerms(context.Background(), "en", "uk")
+	if err != nil {
+		t.Fatalf("GetGlossaryTerms failed: %v", err)
+	}
+	if len(terms) != 0 {
+		t.Errorf("expected 0 terms, got %d", len(terms))
+	}
+}
+
+func TestStore_ListGlossaryTerms(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.AddGlossaryTerm(context.Background(), "en", "uk", "Kyiv", "Київ")
+	s.AddGlossaryTerm(context.Background(), "en", "de", "Kyiv", "Kiew")
+
+	// List all
+	all, err := s.ListGlossaryTerms(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("ListGlossaryTerms failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("expected 2 total entries, got %d", len(all))
+	}
+
+	// Filter by source language
+	enOnly, err := s.ListGlossaryTerms(context.Background(), "en", "uk")
+	if err != nil {
+		t.Fatalf("ListGlossaryTerms failed: %v", err)
+	}
+	if len(enOnly) != 1 {
+		t.Errorf("expected 1 entry for en->uk, got %d", len(enOnly))
+	}
+}
+
+func TestStore_DeleteGlossaryTerm(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.AddGlossaryTerm(context.Background(), "en", "uk", "Kyiv", "Київ")
+
+	entries, _ := s.ListGlossaryTerms(context.Background(), "en", "uk")
+	if len(entries) != 1 {
+		t.Fatal("expected 1 entry before delete")
+	}
+
+	err := s.DeleteGlossaryTerm(context.Background(), entries[0].ID)
+	if err != nil {
+		t.Fatalf("DeleteGlossaryTerm failed: %v", err)
+	}
+
+	entries, _ = s.ListGlossaryTerms(context.Background(), "en", "uk")
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries after delete, got %d", len(entries))
+	}
+}
+
+func TestStore_AddGlossaryTerm_Upsert(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := New(filepath.Join(tmpDir, "test.db"))
+	defer s.Close()
+
+	s.AddGlossaryTerm(context.Background(), "en", "uk", "Kyiv", "Київ")
+	s.AddGlossaryTerm(context.Background(), "en", "uk", "Kyiv", "Кийів") // replace
+
+	terms, _ := s.GetGlossaryTerms(context.Background(), "en", "uk")
+	if len(terms) != 1 {
+		t.Errorf("expected 1 term after upsert, got %d", len(terms))
+	}
+	if terms["Kyiv"] != "Кийів" {
+		t.Errorf("expected updated value 'Кийів', got %q", terms["Kyiv"])
+	}
+}
+

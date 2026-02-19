@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/valpere/peretran/internal/postprocess"
@@ -80,8 +81,7 @@ func (s *OpenRouterService) Translate(ctx context.Context, cfg ServiceConfig, re
 		sourceLang = "the detected language"
 	}
 
-	systemPrompt := fmt.Sprintf(`You are a professional translator. Translate the following text from %s to %s.
-Only respond with the translation, nothing else. No explanations, no quotes, just the translation.`, sourceLang, req.TargetLang)
+	systemPrompt := buildOpenRouterSystemPrompt(sourceLang, req.TargetLang, req.PreviousContext, req.GlossaryTerms, req.Instructions)
 
 	openrouterReq := map[string]interface{}{
 		"model": model,
@@ -170,4 +170,31 @@ func (s *OpenRouterService) SupportedLanguages(ctx context.Context) ([]string, e
 
 func (s *OpenRouterService) GetModels() []string {
 	return s.models
+}
+
+// buildOpenRouterSystemPrompt constructs the system prompt, optionally
+// injecting glossary terms, a sliding-window context, and extra instructions.
+func buildOpenRouterSystemPrompt(sourceLang, targetLang, previousContext string, glossary map[string]string, instructions string) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("You are a professional translator. Translate the following text from %s to %s.\n", sourceLang, targetLang))
+	sb.WriteString("Only respond with the translation, nothing else. No explanations, no quotes, just the translation.")
+
+	if instructions != "" {
+		sb.WriteString(" ")
+		sb.WriteString(instructions)
+	}
+
+	if len(glossary) > 0 {
+		sb.WriteString("\n\nTERMINOLOGY (use these exact translations):\n")
+		for src, tgt := range glossary {
+			sb.WriteString(fmt.Sprintf("  %s → %s\n", src, tgt))
+		}
+	}
+
+	if previousContext != "" {
+		sb.WriteString(fmt.Sprintf("\n\nCONTEXT (previous passage for continuity — do NOT retranslate this):\n...%s", previousContext))
+	}
+
+	return sb.String()
 }

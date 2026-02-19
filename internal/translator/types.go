@@ -14,10 +14,23 @@ type ServiceConfig struct {
 	ProjectID   string        `mapstructure:"project_id" json:"project_id"`
 }
 
+// TranslateRequest is the input to a translation service.
 type TranslateRequest struct {
 	Text       string `json:"text"`
 	SourceLang string `json:"source_lang"`
 	TargetLang string `json:"target_lang"`
+
+	// PreviousContext holds the last ~25 words of the preceding chunk.
+	// LLM-based services use it to maintain continuity across chunk boundaries.
+	PreviousContext string `json:"previous_context,omitempty"`
+
+	// GlossaryTerms maps source terms to required target translations.
+	// LLM-based services inject these into the translation prompt.
+	GlossaryTerms map[string]string `json:"glossary_terms,omitempty"`
+
+	// Instructions is an optional extra instruction appended to the LLM prompt,
+	// e.g. a placeholder-preservation hint when placeholder mode is active.
+	Instructions string `json:"instructions,omitempty"`
 }
 
 type ServiceResult struct {
