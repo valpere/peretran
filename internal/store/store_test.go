@@ -459,11 +459,3 @@ func TestStore_MultipleLanguagePairs(t *testing.T) {
 	}
 }
 
-// BenchmarkStore is a placeholder to ensure store_test.go compiles as a test file
-func TestStore_BenchmarkPlaceholder(t *testing.T) {
-	// This test ensures the file is recognized as a test file
-	// The actual benchmarks would be in *_bench_test.go
-	if context.Background() == nil {
-		t.Log("placeholder test")
-	}
-}
