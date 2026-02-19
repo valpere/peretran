@@ -215,6 +215,10 @@ Check translation_memory (exact-match cache, NFC-normalized)
 - Google credentials: via `-c` flag or `GOOGLE_APPLICATION_CREDENTIALS` env var
 - Other API keys: via `--systran-key`, `--openrouter-key` flags or environment
 
+## Special allowance
+
+You feel free to read the `../context` directory.
+
 ## Author
 
-Valentyn Solomko — valentyn.solomko@gmail.com
+Valentyn Solomko

@@ -233,22 +233,27 @@ func TestOrchestrator_Execute_WithRetry(t *testing.T) {
 
 func TestOrchestrator_Execute_Cancellation(t *testing.T) {
 	svc := &mockService{
-		nameVal: "slow",
+		nameVal: "context-aware",
 		translateFunc: func(ctx context.Context, cfg translator.ServiceConfig, req translator.TranslateRequest) (*translator.ServiceResult, error) {
-			time.Sleep(1 * time.Second)
-			return &translator.ServiceResult{ServiceName: "slow", TranslatedText: "done"}, nil
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+				return &translator.ServiceResult{ServiceName: "context-aware", TranslatedText: "done"}, nil
+			}
 		},
 	}
 	services := []translator.TranslationService{svc}
 
 	o := New(services, OrchestratorConfig{
-		Timeout:     10 * time.Second,
-		MaxAttempts: 3,
-		RetryDelay:  100 * time.Millisecond,
+		Timeout:        5 * time.Second,
+		MaxAttempts:    1,
+		RetryDelay:     100 * time.Millisecond,
+		SkipValidation: true,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel() // Cancel before Execute is called
 
 	req := translator.TranslateRequest{
 		Text:       "Hello",
@@ -258,9 +263,12 @@ func TestOrchestrator_Execute_Cancellation(t *testing.T) {
 
 	result := o.Execute(ctx, translator.ServiceConfig{}, req)
 
-	// With cancelled context, services may still complete since they run in goroutines
-	// The result could succeed or fail depending on timing - just verify no panic
-	_ = result
+	if result.Succeeded != 0 {
+		t.Errorf("expected 0 succeeded with cancelled context, got %d", result.Succeeded)
+	}
+	if result.Failed != 1 {
+		t.Errorf("expected 1 failed with cancelled context, got %d", result.Failed)
+	}
 }
 
 func TestOrchestrator_ExecuteWithFallback(t *testing.T) {
